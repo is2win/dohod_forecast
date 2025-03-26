@@ -825,9 +825,15 @@ class DividendParser:
         logger.info(f"После очистки осталось записей: {len(df)}")
         return df
 
-    def forecast_dividends(self, years=10):
-        """Прогнозирование дивидендов на будущее на основе исторических данных"""
-        logger.info(f"Начинаем прогнозирование дивидендов на {years} лет вперед")
+    def forecast_dividends(self, years=10, history_years=3):
+        """Прогнозирование дивидендов на будущее на основе исторических данных
+        
+        Args:
+            years (int): Количество лет вперед для прогнозирования
+            history_years (int): Глубина (количество лет) для проверки наличия недавних выплат
+                               Если за последние history_years лет нет выплат, применяется критический сценарий
+        """
+        logger.info(f"Начинаем прогнозирование дивидендов на {years} лет вперед (проверка активности за последние {history_years} лет)")
         
         if self.clean_df.empty:
             logger.warning("Нет данных для прогнозирования")
@@ -842,6 +848,9 @@ class DividendParser:
         
         # Текущий год для расчета прогнозов
         current_year = datetime.now().year
+        
+        # Минимальный год для проверки активности компании
+        recent_activity_year = current_year - history_years
         
         # Создаем пустой список для прогнозов
         forecast_data = []
@@ -862,10 +871,13 @@ class DividendParser:
             # Собираем все фактические выплаты для акции (для возможного годового прогноза)
             all_payments = []
             
+            # Собираем выплаты за последние years лет для проверки активности
+            recent_payments_sum = 0
+            
             # Сохраняем все уникальные даты выплат внутри года для более точного прогноза
             annual_payment_dates = {}
             
-            # Анализируем все исторические данные (без ограничения на последние 2 года)
+            # Анализируем все исторические данные (без ограничения на последние годы)
             for _, row in group.iterrows():
                 # Обрабатываем фактические выплаты
                 if row['forecast_type'] == 0 and row['year'] is not None:
@@ -877,6 +889,10 @@ class DividendParser:
                             'month': row['month'],
                             'year': row['year']
                         })
+                        
+                        # Проверяем, входит ли запись в период для анализа активности
+                        if row['year'] >= recent_activity_year:
+                            recent_payments_sum += row['dividend_value']
                         
                         # Сохраняем информацию о датах выплат внутри года
                         if row['record_date'] is not None and isinstance(row['record_date'], datetime):
@@ -921,335 +937,10 @@ class DividendParser:
             # Для каждого квартала делаем прогноз
             ticker_forecast_count = 0
             
-            # Проверяем наличие квартальных данных
-            has_quarterly_data = False
-            for quarter, history in ticker_quarters.items():
-                if len(history) > 1:  # Требуем более одной записи для квартала
-                    has_quarterly_data = True
-                    break
-            
-            # Если у акции всего один исторический платеж, не используем стратегию 3.1
-            if len(all_payments) <= 1:
-                has_quarterly_data = False
-            
-            # Если у нас есть достаточно квартальных данных, используем их для прогноза (стратегия 3.1)
-            if has_quarterly_data:
-                for quarter, history in ticker_quarters.items():
-                    if not history:
-                        continue
-                    
-                    # Рассчитываем средний дивиденд за квартал
-                    avg_dividend = sum(item['dividend_value'] for item in history) / len(history)
-                    
-                    # Определяем типичный месяц выплаты
-                    months = [item['month'] for item in history 
-                             if pd.notnull(item['month'])]
-                    
-                    if not months:
-                        # Если нет данных о месяце, используем текущий месяц
-                        most_common_month = datetime.now().month
-                    else:
-                        most_common_month = int(max(set(months), key=months.count))
-                    
-                    # Определяем типичный день выплаты
-                    days = [item['record_date'].day for item in history 
-                           if isinstance(item['record_date'], datetime) 
-                           and item['record_date'].month == most_common_month]
-                    
-                    if not days:
-                        most_common_day = 15  # По умолчанию середина месяца
-                    else:
-                        most_common_day = int(sum(days) // len(days))
-                    
-                    logger.info(f"Для {ticker}, Q{quarter}: месяц={most_common_month}, день={most_common_day}, средний дивиденд={avg_dividend:.2f}")
-                    
-                    # Создаем прогнозы на будущие периоды
-                    for future_year in range(current_year + 1, current_year + years + 1):
-                        try:
-                            # Проверяем, есть ли прогноз с сайта доход на этот год и квартал
-                            forecast_key = f"{future_year}-{quarter}"
-                            site_forecast = site_forecasts.get(forecast_key)
-                            
-                            # Создаем дату закрытия реестра (убедимся, что все значения целочисленные)
-                            future_year_int = int(future_year)
-                            month_int = int(most_common_month)
-                            day_int = int(most_common_day)
-                            
-                            # Если есть прогноз сайта, используем его дату, иначе генерируем свою
-                            if site_forecast and site_forecast['record_date']:
-                                forecast_date = site_forecast['record_date']
-                                # Используем дивиденд из прогноза сайта
-                                dividend_value = site_forecast['dividend_value']
-                            else:
-                                try:
-                                    forecast_date = datetime(future_year_int, month_int, day_int)
-                                    # Используем наш расчетный дивиденд
-                                    dividend_value = round(avg_dividend, 2)
-                                except ValueError:
-                                    # Обработка ошибок с невалидными датами
-                                    if month_int == 2 and day_int > 28:
-                                        # Для февраля используем последний день месяца
-                                        if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
-                                            # Високосный год
-                                            forecast_date = datetime(future_year_int, 2, 29)
-                                        else:
-                                            # Не високосный год
-                                            forecast_date = datetime(future_year_int, 2, 28)
-                                    elif day_int > 30 and month_int in [4, 6, 9, 11]:
-                                        # Для месяцев с 30 днями
-                                        forecast_date = datetime(future_year_int, month_int, 30)
-                                    else:
-                                        # Для других случаев используем предыдущий месяц
-                                        if month_int > 1:
-                                            next_month = datetime(future_year_int, month_int, 1)
-                                            forecast_date = next_month - timedelta(days=1)
-                                        else:
-                                            forecast_date = datetime(future_year_int - 1, 12, 31)
-                                    dividend_value = round(avg_dividend, 2)
-                        
-                            # Добавляем прогноз
-                            forecast_data.append({
-                                'ticker': ticker,
-                                'name': group['name'].iloc[0],
-                                'record_date': forecast_date,
-                                'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                                'dividend_value': dividend_value,
-                                'period': f"Q{quarter} {future_year}",
-                                'forecast_type': 2,  # Наш прогноз (тип 2)
-                                'year': future_year,
-                                'quarter': quarter,
-                                'month': forecast_date.month,
-                                'announcement_date': "no data",
-                                'forecast_strategy': "3.1 - Квартальные данные"  # Стратегия 3.1 из документации
-                            })
-                            ticker_forecast_count += 1
-                            
-                        except Exception as e:
-                            logger.error(f"Не удалось создать прогноз для {ticker}, Q{quarter} {future_year}: {e}")
-                            continue
-            
-            # Если у нас нет квартальных данных, но есть исторические даты выплат внутри года
-            if ticker_forecast_count == 0 and annual_payment_dates:
-                logger.info(f"Для {ticker} используем исторические даты выплат внутри года для прогноза")
-                
-                # Для каждой уникальной даты внутри года делаем прогноз
-                for (month, day), payments in annual_payment_dates.items():
-                    try:
-                        # Считаем средний дивиденд для этой даты
-                        avg_dividend = sum(item['dividend_value'] for item in payments) / len(payments)
-                        
-                        # Определяем квартал (если возможно)
-                        quarters = [item['quarter'] for item in payments if item['quarter'] is not None]
-                        if quarters:
-                            # Берем наиболее частый квартал
-                            quarter = max(set(quarters), key=quarters.count)
-                        else:
-                            # Определяем квартал по месяцу
-                            quarter = (month - 1) // 3 + 1
-                        
-                        logger.info(f"Для {ticker}, дата {month}-{day}: квартал={quarter}, средний дивиденд={avg_dividend:.2f}")
-                        
-                        # Создаем прогнозы на будущие периоды
-                        for future_year in range(current_year + 1, current_year + years + 1):
-                            try:
-                                future_year_int = int(future_year)
-                                
-                                try:
-                                    # Создаем дату закрытия реестра
-                                    forecast_date = datetime(future_year_int, month, day)
-                                except ValueError:
-                                    # Обработка невалидных дат
-                                    if month == 2 and day > 28:
-                                        if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
-                                            forecast_date = datetime(future_year_int, 2, 29)
-                                        else:
-                                            forecast_date = datetime(future_year_int, 2, 28)
-                                    elif day > 30 and month in [4, 6, 9, 11]:
-                                        forecast_date = datetime(future_year_int, month, 30)
-                                    else:
-                                        if month > 1:
-                                            next_month = datetime(future_year_int, month, 1)
-                                            forecast_date = next_month - timedelta(days=1)
-                                        else:
-                                            forecast_date = datetime(future_year_int - 1, 12, 31)
-                                
-                                dividend_value = round(avg_dividend, 2)
-                                
-                                # Добавляем прогноз
-                                forecast_data.append({
-                                    'ticker': ticker,
-                                    'name': group['name'].iloc[0],
-                                    'record_date': forecast_date,
-                                    'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                                    'dividend_value': dividend_value,
-                                    'period': f"Q{quarter} {future_year}",
-                                    'forecast_type': 2,  # Наш прогноз (тип 2)
-                                    'year': future_year,
-                                    'quarter': quarter,
-                                    'month': forecast_date.month,
-                                    'announcement_date': "no data",
-                                    'forecast_strategy': "3.2 - Даты выплат"  # Стратегия 3.2 из документации
-                                })
-                                ticker_forecast_count += 1
-                            
-                            except Exception as e:
-                                logger.error(f"Не удалось создать прогноз для {ticker} на дату {month}-{day} {future_year}: {e}")
-                                continue
-                    
-                    except Exception as e:
-                        logger.error(f"Ошибка при анализе исторических дат выплат для {ticker}: {e}")
-
-            # Если все еще нет прогнозов, используем годовые данные
-            if ticker_forecast_count == 0 and len(all_payments) > 0:
+            # Проверяем, были ли выплаты за последние history_years лет
+            if recent_payments_sum == 0:
+                logger.info(f"Для {ticker} нет выплат за последние {history_years} лет, применяем критический сценарий")
                 try:
-                    logger.info(f"Для {ticker} недостаточно данных о датах выплат, создаем годовой прогноз")
-                    
-                    # Рассчитываем средний дивиденд
-                    avg_dividend = sum(item['dividend_value'] for item in all_payments) / len(all_payments)
-                    
-                    # Определяем типичные даты выплат по кварталам
-                    quarterly_dates = []
-                    
-                    # Если нет информации о квартальных датах, используем стандартные
-                    if not quarterly_dates:
-                        # Стандартные даты для каждого квартала
-                        quarterly_dates = [
-                            (3, 15),   # Q1 - 15 марта
-                            (6, 15),   # Q2 - 15 июня
-                            (9, 15),   # Q3 - 15 сентября
-                            (12, 15)   # Q4 - 15 декабря
-                        ]
-                    
-                    # Создаем прогнозы для каждого квартала
-                    for quarter, (month, day) in enumerate(quarterly_dates, 1):
-                        # Дивиденд за квартал - делим годовой на 4 квартала
-                        quarterly_dividend = round(avg_dividend / 4, 2)
-                        
-                        for future_year in range(current_year + 1, current_year + years + 1):
-                            try:
-                                future_year_int = int(future_year)
-                                
-                                try:
-                                    forecast_date = datetime(future_year_int, month, day)
-                                except ValueError:
-                                    # Обработка невалидных дат
-                                    if month == 2 and day > 28:
-                                        if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
-                                            forecast_date = datetime(future_year_int, 2, 29)
-                                        else:
-                                            forecast_date = datetime(future_year_int, 2, 28)
-                                    elif day > 30 and month in [4, 6, 9, 11]:
-                                        forecast_date = datetime(future_year_int, month, 30)
-                                    else:
-                                        if month > 1:
-                                            next_month = datetime(future_year_int, month, 1)
-                                            forecast_date = next_month - timedelta(days=1)
-                                        else:
-                                            forecast_date = datetime(future_year_int - 1, 12, 31)
-                                
-                                # Добавляем прогноз для квартала
-                                forecast_data.append({
-                                    'ticker': ticker,
-                                    'name': group['name'].iloc[0],
-                                    'record_date': forecast_date,
-                                    'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                                    'dividend_value': quarterly_dividend,
-                                    'period': f"Q{quarter} {future_year}",
-                                    'forecast_type': 2,  # Наш прогноз (тип 2)
-                                    'year': future_year,
-                                    'quarter': quarter,
-                                    'month': forecast_date.month,
-                                    'announcement_date': "no data",
-                                    'forecast_strategy': "3.3 - Годовые данные"  # Стратегия 3.3 из документации
-                                })
-                                ticker_forecast_count += 1
-                                
-                            except Exception as e:
-                                logger.error(f"Не удалось создать квартальный прогноз для {ticker} Q{quarter} {future_year}: {e}")
-                                continue
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка при создании квартальных прогнозов для {ticker}: {e}")
-                    
-                    # Если квартальные прогнозы не получились, делаем хотя бы один годовой прогноз
-                    try:
-                        # Определяем среднюю дату выплаты
-                        months = [item['month'] for item in all_payments if pd.notnull(item['month'])]
-                        if not months:
-                            most_common_month = 6  # По умолчанию середина года
-                        else:
-                            most_common_month = int(max(set(months), key=months.count))
-                        
-                        # Определяем типичный день выплаты
-                        days = [item['record_date'].day for item in all_payments 
-                              if isinstance(item['record_date'], datetime) 
-                              and pd.notnull(item['record_date'])]
-                        
-                        if not days:
-                            most_common_day = 15  # По умолчанию середина месяца
-                        else:
-                            most_common_day = int(sum(days) // len(days))
-                        
-                        # Рассчитываем годовой дивиденд
-                        yearly_dividend = avg_dividend
-                        
-                        # Создаем годовые прогнозы
-                        for future_year in range(current_year + 1, current_year + years + 1):
-                            try:
-                                future_year_int = int(future_year)
-                                month_int = int(most_common_month)
-                                day_int = int(most_common_day)
-                                
-                                try:
-                                    forecast_date = datetime(future_year_int, month_int, day_int)
-                                except ValueError:
-                                    # Обработка невалидных дат
-                                    if month_int == 2 and day_int > 28:
-                                        if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
-                                            forecast_date = datetime(future_year_int, 2, 29)
-                                        else:
-                                            forecast_date = datetime(future_year_int, 2, 28)
-                                    elif day_int > 30 and month_int in [4, 6, 9, 11]:
-                                        forecast_date = datetime(future_year_int, month_int, 30)
-                                    else:
-                                        if month_int > 1:
-                                            next_month = datetime(future_year_int, month_int, 1)
-                                            forecast_date = next_month - timedelta(days=1)
-                                        else:
-                                            forecast_date = datetime(future_year_int - 1, 12, 31)
-                                
-                                # Добавляем годовой прогноз
-                                forecast_data.append({
-                                    'ticker': ticker,
-                                    'name': group['name'].iloc[0],
-                                    'record_date': forecast_date,
-                                    'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                                    'dividend_value': round(yearly_dividend, 2),
-                                    'period': f"Год {future_year}",
-                                    'forecast_type': 2,  # Наш прогноз (тип 2)
-                                    'year': future_year,
-                                    'quarter': None,  # Годовой прогноз без квартала
-                                    'month': forecast_date.month,
-                                    'announcement_date': "no data",
-                                    'forecast_strategy': "3.3 - Единый годовой"  # Вариант стратегии 3.3
-                                })
-                                ticker_forecast_count += 1
-                                
-                            except Exception as e:
-                                logger.error(f"Не удалось создать годовой прогноз для {ticker} {future_year}: {e}")
-                                continue
-                    
-                    except Exception as e:
-                        logger.error(f"Ошибка при создании годового прогноза для {ticker}: {e}")
-            
-            # Если всё еще нет прогнозов, создаем что-то минимальное
-            if ticker_forecast_count == 0:
-                try:
-                    logger.info(f"Для {ticker} создаем минимальный прогноз на основе доступной информации")
-                    
-                    # Устанавливаем дивиденд равным нулю вместо среднего или дефолтного значения
-                    default_dividend = 0.0
-                    
                     # Создаем стандартные квартальные даты
                     quarterly_dates = [
                         (3, 15),   # Q1 - 15 марта
@@ -1298,16 +989,397 @@ class DividendParser:
                                     'quarter': quarter,
                                     'month': forecast_date.month,
                                     'announcement_date': "no data",
-                                    'forecast_strategy': "3.4 - Аварийная стратегия"  # Стратегия 3.4 из документации
+                                    'forecast_strategy': "3.4 - Неактивная компания"  # Специальная маркировка для неактивных компаний
                                 })
                                 ticker_forecast_count += 1
                                 
                             except Exception as e:
-                                logger.error(f"Не удалось создать дефолтный прогноз для {ticker} Q{quarter} {future_year}: {e}")
+                                logger.error(f"Не удалось создать прогноз для неактивной компании {ticker} Q{quarter} {future_year}: {e}")
                                 continue
-                    
+                
                 except Exception as e:
-                    logger.error(f"Ошибка при создании минимального прогноза для {ticker}: {e}")
+                    logger.error(f"Ошибка при создании прогноза для неактивной компании {ticker}: {e}")
+            
+            else:
+                # Проверяем наличие квартальных данных
+                has_quarterly_data = False
+                for quarter, history in ticker_quarters.items():
+                    if len(history) > 1:  # Требуем более одной записи для квартала
+                        has_quarterly_data = True
+                        break
+                
+                # Если у акции всего один исторический платеж, не используем стратегию 3.1
+                if len(all_payments) <= 1:
+                    has_quarterly_data = False
+                
+                # Если у нас есть достаточно квартальных данных, используем их для прогноза (стратегия 3.1)
+                if has_quarterly_data:
+                    for quarter, history in ticker_quarters.items():
+                        if not history:
+                            continue
+                        
+                        # Рассчитываем средний дивиденд за квартал
+                        avg_dividend = sum(item['dividend_value'] for item in history) / len(history)
+                        
+                        # Определяем типичный месяц выплаты
+                        months = [item['month'] for item in history 
+                                 if pd.notnull(item['month'])]
+                        
+                        if not months:
+                            # Если нет данных о месяце, используем текущий месяц
+                            most_common_month = datetime.now().month
+                        else:
+                            most_common_month = int(max(set(months), key=months.count))
+                        
+                        # Определяем типичный день выплаты
+                        days = [item['record_date'].day for item in history 
+                               if isinstance(item['record_date'], datetime) 
+                               and item['record_date'].month == most_common_month]
+                        
+                        if not days:
+                            most_common_day = 15  # По умолчанию середина месяца
+                        else:
+                            most_common_day = int(sum(days) // len(days))
+                        
+                        logger.info(f"Для {ticker}, Q{quarter}: месяц={most_common_month}, день={most_common_day}, средний дивиденд={avg_dividend:.2f}")
+                        
+                        # Создаем прогнозы на будущие периоды
+                        for future_year in range(current_year + 1, current_year + years + 1):
+                            try:
+                                # Проверяем, есть ли прогноз с сайта доход на этот год и квартал
+                                forecast_key = f"{future_year}-{quarter}"
+                                site_forecast = site_forecasts.get(forecast_key)
+                                
+                                # Создаем дату закрытия реестра (убедимся, что все значения целочисленные)
+                                future_year_int = int(future_year)
+                                month_int = int(most_common_month)
+                                day_int = int(most_common_day)
+                                
+                                # Если есть прогноз сайта, используем его дату, иначе генерируем свою
+                                if site_forecast and site_forecast['record_date']:
+                                    forecast_date = site_forecast['record_date']
+                                    # Используем дивиденд из прогноза сайта
+                                    dividend_value = site_forecast['dividend_value']
+                                else:
+                                    try:
+                                        forecast_date = datetime(future_year_int, month_int, day_int)
+                                        # Используем наш расчетный дивиденд
+                                        dividend_value = round(avg_dividend, 2)
+                                    except ValueError:
+                                        # Обработка ошибок с невалидными датами
+                                        if month_int == 2 and day_int > 28:
+                                            # Для февраля используем последний день месяца
+                                            if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
+                                                # Високосный год
+                                                forecast_date = datetime(future_year_int, 2, 29)
+                                            else:
+                                                # Не високосный год
+                                                forecast_date = datetime(future_year_int, 2, 28)
+                                        elif day_int > 30 and month_int in [4, 6, 9, 11]:
+                                            # Для месяцев с 30 днями
+                                            forecast_date = datetime(future_year_int, month_int, 30)
+                                        else:
+                                            # Для других случаев используем предыдущий месяц
+                                            if month_int > 1:
+                                                next_month = datetime(future_year_int, month_int, 1)
+                                                forecast_date = next_month - timedelta(days=1)
+                                            else:
+                                                forecast_date = datetime(future_year_int - 1, 12, 31)
+                                        dividend_value = round(avg_dividend, 2)
+                            
+                                # Добавляем прогноз
+                                forecast_data.append({
+                                    'ticker': ticker,
+                                    'name': group['name'].iloc[0],
+                                    'record_date': forecast_date,
+                                    'record_date_str': forecast_date.strftime('%d.%m.%Y'),
+                                    'dividend_value': dividend_value,
+                                    'period': f"Q{quarter} {future_year}",
+                                    'forecast_type': 2,  # Наш прогноз (тип 2)
+                                    'year': future_year,
+                                    'quarter': quarter,
+                                    'month': forecast_date.month,
+                                    'announcement_date': "no data",
+                                    'forecast_strategy': "3.1 - Квартальные данные"  # Стратегия 3.1 из документации
+                                })
+                                ticker_forecast_count += 1
+                                
+                            except Exception as e:
+                                logger.error(f"Не удалось создать прогноз для {ticker}, Q{quarter} {future_year}: {e}")
+                                continue
+                
+                # Если у нас нет квартальных данных, но есть исторические даты выплат внутри года
+                if ticker_forecast_count == 0 and annual_payment_dates:
+                    logger.info(f"Для {ticker} используем исторические даты выплат внутри года для прогноза")
+                    
+                    # Для каждой уникальной даты внутри года делаем прогноз
+                    for (month, day), payments in annual_payment_dates.items():
+                        try:
+                            # Считаем средний дивиденд для этой даты
+                            avg_dividend = sum(item['dividend_value'] for item in payments) / len(payments)
+                            
+                            # Определяем квартал (если возможно)
+                            quarters = [item['quarter'] for item in payments if item['quarter'] is not None]
+                            if quarters:
+                                # Берем наиболее частый квартал
+                                quarter = max(set(quarters), key=quarters.count)
+                            else:
+                                # Определяем квартал по месяцу
+                                quarter = (month - 1) // 3 + 1
+                            
+                            logger.info(f"Для {ticker}, дата {month}-{day}: квартал={quarter}, средний дивиденд={avg_dividend:.2f}")
+                            
+                            # Создаем прогнозы на будущие периоды
+                            for future_year in range(current_year + 1, current_year + years + 1):
+                                try:
+                                    future_year_int = int(future_year)
+                                    
+                                    try:
+                                        # Создаем дату закрытия реестра
+                                        forecast_date = datetime(future_year_int, month, day)
+                                    except ValueError:
+                                        # Обработка невалидных дат
+                                        if month == 2 and day > 28:
+                                            if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
+                                                forecast_date = datetime(future_year_int, 2, 29)
+                                            else:
+                                                forecast_date = datetime(future_year_int, 2, 28)
+                                        elif day > 30 and month in [4, 6, 9, 11]:
+                                            forecast_date = datetime(future_year_int, month, 30)
+                                        else:
+                                            if month > 1:
+                                                next_month = datetime(future_year_int, month, 1)
+                                                forecast_date = next_month - timedelta(days=1)
+                                            else:
+                                                forecast_date = datetime(future_year_int - 1, 12, 31)
+                                    
+                                    dividend_value = round(avg_dividend, 2)
+                                    
+                                    # Добавляем прогноз
+                                    forecast_data.append({
+                                        'ticker': ticker,
+                                        'name': group['name'].iloc[0],
+                                        'record_date': forecast_date,
+                                        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
+                                        'dividend_value': dividend_value,
+                                        'period': f"Q{quarter} {future_year}",
+                                        'forecast_type': 2,  # Наш прогноз (тип 2)
+                                        'year': future_year,
+                                        'quarter': quarter,
+                                        'month': forecast_date.month,
+                                        'announcement_date': "no data",
+                                        'forecast_strategy': "3.2 - Даты выплат"  # Стратегия 3.2 из документации
+                                    })
+                                    ticker_forecast_count += 1
+                                
+                                except Exception as e:
+                                    logger.error(f"Не удалось создать прогноз для {ticker} на дату {month}-{day} {future_year}: {e}")
+                                    continue
+                        
+                        except Exception as e:
+                            logger.error(f"Ошибка при анализе исторических дат выплат для {ticker}: {e}")
+                
+                # Если все еще нет прогнозов, используем годовые данные
+                if ticker_forecast_count == 0 and len(all_payments) > 0:
+                    try:
+                        logger.info(f"Для {ticker} недостаточно данных о датах выплат, создаем годовой прогноз")
+                        
+                        # Рассчитываем средний дивиденд
+                        avg_dividend = sum(item['dividend_value'] for item in all_payments) / len(all_payments)
+                        
+                        # Определяем типичные даты выплат по кварталам
+                        quarterly_dates = [
+                            (3, 15),   # Q1 - 15 марта
+                            (6, 15),   # Q2 - 15 июня
+                            (9, 15),   # Q3 - 15 сентября
+                            (12, 15)   # Q4 - 15 декабря
+                        ]
+                        
+                        # Создаем прогнозы для каждого квартала
+                        for quarter, (month, day) in enumerate(quarterly_dates, 1):
+                            # Дивиденд за квартал - делим годовой на 4 квартала
+                            quarterly_dividend = round(avg_dividend / 4, 2)
+                            
+                            for future_year in range(current_year + 1, current_year + years + 1):
+                                try:
+                                    future_year_int = int(future_year)
+                                    
+                                    try:
+                                        forecast_date = datetime(future_year_int, month, day)
+                                    except ValueError:
+                                        # Обработка невалидных дат
+                                        if month == 2 and day > 28:
+                                            if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
+                                                forecast_date = datetime(future_year_int, 2, 29)
+                                            else:
+                                                forecast_date = datetime(future_year_int, 2, 28)
+                                        elif day > 30 and month in [4, 6, 9, 11]:
+                                            forecast_date = datetime(future_year_int, month, 30)
+                                        else:
+                                            if month > 1:
+                                                next_month = datetime(future_year_int, month, 1)
+                                                forecast_date = next_month - timedelta(days=1)
+                                            else:
+                                                forecast_date = datetime(future_year_int - 1, 12, 31)
+                                    
+                                    # Добавляем прогноз для квартала
+                                    forecast_data.append({
+                                        'ticker': ticker,
+                                        'name': group['name'].iloc[0],
+                                        'record_date': forecast_date,
+                                        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
+                                        'dividend_value': quarterly_dividend,
+                                        'period': f"Q{quarter} {future_year}",
+                                        'forecast_type': 2,  # Наш прогноз (тип 2)
+                                        'year': future_year,
+                                        'quarter': quarter,
+                                        'month': forecast_date.month,
+                                        'announcement_date': "no data",
+                                        'forecast_strategy': "3.3 - Годовые данные"  # Стратегия 3.3 из документации
+                                    })
+                                    ticker_forecast_count += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"Не удалось создать квартальный прогноз для {ticker} Q{quarter} {future_year}: {e}")
+                                    continue
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка при создании годового прогноза для {ticker}: {e}")
+                        
+                        # Если квартальные прогнозы не получились, делаем хотя бы один годовой прогноз
+                        try:
+                            # Определяем среднюю дату выплаты
+                            months = [item['month'] for item in all_payments if pd.notnull(item['month'])]
+                            if not months:
+                                most_common_month = 6  # По умолчанию середина года
+                            else:
+                                most_common_month = int(max(set(months), key=months.count))
+                            
+                            # Определяем типичный день выплаты
+                            days = [item['record_date'].day for item in all_payments 
+                                  if isinstance(item['record_date'], datetime) 
+                                  and pd.notnull(item['record_date'])]
+                            
+                            if not days:
+                                most_common_day = 15  # По умолчанию середина месяца
+                            else:
+                                most_common_day = int(sum(days) // len(days))
+                            
+                            # Рассчитываем годовой дивиденд
+                            yearly_dividend = avg_dividend
+                            
+                            # Создаем годовые прогнозы
+                            for future_year in range(current_year + 1, current_year + years + 1):
+                                try:
+                                    future_year_int = int(future_year)
+                                    month_int = int(most_common_month)
+                                    day_int = int(most_common_day)
+                                    
+                                    try:
+                                        forecast_date = datetime(future_year_int, month_int, day_int)
+                                    except ValueError:
+                                        # Обработка невалидных дат
+                                        if month_int == 2 and day_int > 28:
+                                            if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
+                                                forecast_date = datetime(future_year_int, 2, 29)
+                                            else:
+                                                forecast_date = datetime(future_year_int, 2, 28)
+                                        elif day_int > 30 and month_int in [4, 6, 9, 11]:
+                                            forecast_date = datetime(future_year_int, month_int, 30)
+                                        else:
+                                            if month_int > 1:
+                                                next_month = datetime(future_year_int, month_int, 1)
+                                                forecast_date = next_month - timedelta(days=1)
+                                            else:
+                                                forecast_date = datetime(future_year_int - 1, 12, 31)
+                                    
+                                    # Добавляем годовой прогноз
+                                    forecast_data.append({
+                                        'ticker': ticker,
+                                        'name': group['name'].iloc[0],
+                                        'record_date': forecast_date,
+                                        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
+                                        'dividend_value': round(yearly_dividend, 2),
+                                        'period': f"Год {future_year}",
+                                        'forecast_type': 2,  # Наш прогноз (тип 2)
+                                        'year': future_year,
+                                        'quarter': None,  # Годовой прогноз без квартала
+                                        'month': forecast_date.month,
+                                        'announcement_date': "no data",
+                                        'forecast_strategy': "3.3 - Единый годовой"  # Вариант стратегии 3.3
+                                    })
+                                    ticker_forecast_count += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"Не удалось создать годовой прогноз для {ticker} {future_year}: {e}")
+                                    continue
+                        
+                        except Exception as e:
+                            logger.error(f"Ошибка при создании единого годового прогноза для {ticker}: {e}")
+                            
+                # Если всё еще нет прогнозов, создаем аварийный прогноз
+                if ticker_forecast_count == 0:
+                    try:
+                        logger.info(f"Для {ticker} создаем аварийный прогноз")
+                        
+                        # Стандартные квартальные даты
+                        quarterly_dates = [
+                            (3, 15),   # Q1 - 15 марта
+                            (6, 15),   # Q2 - 15 июня
+                            (9, 15),   # Q3 - 15 сентября
+                            (12, 15)   # Q4 - 15 декабря
+                        ]
+                        
+                        # Создаем прогнозы для каждого квартала
+                        for quarter, (month, day) in enumerate(quarterly_dates, 1):
+                            # Дивиденд за квартал равен нулю
+                            quarterly_dividend = 0.0
+                            
+                            for future_year in range(current_year + 1, current_year + years + 1):
+                                try:
+                                    future_year_int = int(future_year)
+                                    
+                                    try:
+                                        forecast_date = datetime(future_year_int, month, day)
+                                    except ValueError:
+                                        # Обработка невалидных дат
+                                        if month == 2 and day > 28:
+                                            if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
+                                                forecast_date = datetime(future_year_int, 2, 29)
+                                            else:
+                                                forecast_date = datetime(future_year_int, 2, 28)
+                                        elif day > 30 and month in [4, 6, 9, 11]:
+                                            forecast_date = datetime(future_year_int, month, 30)
+                                        else:
+                                            if month > 1:
+                                                next_month = datetime(future_year_int, month, 1)
+                                                forecast_date = next_month - timedelta(days=1)
+                                            else:
+                                                forecast_date = datetime(future_year_int - 1, 12, 31)
+                                    
+                                    # Добавляем прогноз для квартала
+                                    forecast_data.append({
+                                        'ticker': ticker,
+                                        'name': group['name'].iloc[0],
+                                        'record_date': forecast_date,
+                                        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
+                                        'dividend_value': quarterly_dividend,
+                                        'period': f"Q{quarter} {future_year}",
+                                        'forecast_type': 2,  # Наш прогноз (тип 2)
+                                        'year': future_year,
+                                        'quarter': quarter,
+                                        'month': forecast_date.month,
+                                        'announcement_date': "no data",
+                                        'forecast_strategy': "3.4 - Аварийная стратегия"  # Стратегия 3.4 из документации
+                                    })
+                                    ticker_forecast_count += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"Не удалось создать аварийный прогноз для {ticker} Q{quarter} {future_year}: {e}")
+                                    continue
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка при создании аварийного прогноза для {ticker}: {e}")
             
             forecasts_by_ticker[ticker] = ticker_forecast_count
         
@@ -1427,8 +1499,8 @@ def main():
             # Очищаем данные
             parser.clean_data()
             
-            # Делаем прогноз на 10 лет
-            parser.forecast_dividends(years=10)
+            # Делаем прогноз на 10 лет вперед, используя данные за 3 года
+            parser.forecast_dividends(years=10, history_years=3)
             
             # Сохраняем результаты в Excel
             excel_file = parser.save_to_excel()
