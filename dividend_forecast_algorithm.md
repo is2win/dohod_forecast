@@ -7,9 +7,11 @@
 ## Входные данные
 
 - **Исторические данные о дивидендах**: информация о прошлых выплатах (дата, сумма, период)
+- **Прогнозы с сайта**: прогнозы дивидендов с сайта dohod.ru
 - **Список акций**: список компаний для анализа
 - **Параметры прогнозирования**: 
   - `years`: количество лет для прогнозирования (по умолчанию 10)
+  - `history_years`: количество лет для проверки активности компании (по умолчанию 3)
 
 ## Основные шаги алгоритма
 
@@ -19,6 +21,7 @@
 - Анализ таблиц с историческими выплатами
 - Выделение информации из таблицы "Все выплаты" (игнорирование таблицы "Совокупные выплаты по годам")
 - Структурирование данных о фактических выплатах дивидендов
+- Сбор прогнозов с сайта для будущих периодов
 
 ### 2. Предварительная обработка данных
 
@@ -40,32 +43,68 @@ df['forecast_strategy'] = df['forecast_type'].apply(
 
 Алгоритм использует каскадный подход, применяя следующие стратегии в порядке приоритета:
 
-#### Проверка активности компании
+#### 3.0. Добавление прогнозов с сайта для текущего года
 
-Перед выбором стратегии прогнозирования, алгоритм проверяет активность компании:
-
-1. **Проверка выплат за последние 3 года**:
-   - Рассчитывается суммарный размер дивидендов за последние 3 года
-   - Если сумма равна нулю, компания считается неактивной
-
-2. **Обработка неактивных компаний**:
-   - Для неактивных компаний применяется стратегия 3.4
-   - Прогнозные дивиденды устанавливаются равными нулю
-   - Создаются прогнозы с нулевыми дивидендами для всех кварталов
+В начале алгоритма добавляются прогнозы с сайта для текущего года:
 
 ```python
-# Проверяем активность компании - если нет выплат за последние 3 года,
-# применяем критический сценарий (нулевые дивиденды)
-recent_years = [y for y in range(current_year - 3, current_year + 1)]
-recent_payments = [p for p in all_payments if p['year'] in recent_years]
+# Сначала добавляем прогнозы с сайта для текущего года
+if site_forecasts:
+    logger.info(f"Для {ticker} есть прогнозы с сайта, проверяем прогнозы для текущего года")
+    
+    # Добавляем прогнозы для текущего года с сайта
+    for forecast_key, site_forecast in site_forecasts.items():
+        try:
+            forecast_year = site_forecast['year']
+            quarter = site_forecast['quarter']
+            
+            # Добавляем только прогнозы для текущего года
+            if forecast_year == current_year:
+                forecast_date = site_forecast['record_date']
+                
+                # Добавляем прогноз на основе данных с сайта
+                forecast_data.append({
+                    'ticker': ticker,
+                    'name': group['name'].iloc[0],
+                    'record_date': forecast_date,
+                    'record_date_str': forecast_date.strftime('%d.%m.%Y') if forecast_date else "no data",
+                    'dividend_value': site_forecast['dividend_value'],
+                    'period': f"Q{quarter} {forecast_year}" if quarter else f"{forecast_year}",
+                    'forecast_type': 2,  # Наш прогноз (тип 2)
+                    'year': forecast_year,
+                    'quarter': quarter,
+                    'month': forecast_date.month if forecast_date else None,
+                    'announcement_date': "no data",
+                    'forecast_strategy': "3.0 - Прогноз на основе данных сайта (текущий год)"
+                })
+        except Exception as e:
+            logger.error(f"Не удалось добавить прогноз с сайта для {ticker} на текущий год: {e}")
+```
 
-# Сумма дивидендов за последние 3 года
-recent_sum = sum(p['dividend_value'] for p in recent_payments)
+#### Проверка активности компании и прогнозов с сайта
 
-# Если сумма выплат за последние 3 года равна нулю,
-# считаем компанию неактивной и применяем критический сценарий
-if recent_sum == 0:
-    logger.info(f"Компания {ticker} не проявляет активности по выплатам последние 3 года. Применяем критический сценарий.")
+После добавления прогнозов для текущего года, алгоритм проверяет:
+1. Активность компании (наличие выплат за последние 3 года)
+2. Наличие ненулевых прогнозов с сайта
+
+Критический сценарий (нулевые дивиденды) применяется если:
+- Нет выплат за последние 3 года
+- ИЛИ все прогнозы с сайта нулевые
+
+```python
+# Проверяем, были ли выплаты за последние history_years лет и/или нулевые прогнозы с сайта
+if recent_payments_sum == 0 or (site_forecasts and site_forecasts_sum == 0):
+    logger_message = f"Для {ticker} "
+    if recent_payments_sum == 0:
+        logger_message += f"нет выплат за последние {history_years} лет"
+        if site_forecasts and site_forecasts_sum == 0:
+            logger_message += " или "
+    
+    if site_forecasts and site_forecasts_sum == 0:
+        logger_message += "все прогнозы с сайта нулевые"
+    
+    logger_message += ", применяем критический сценарий"
+    logger.info(logger_message)
     
     # Создаем стандартные квартальные даты
     quarterly_dates = [
@@ -93,10 +132,47 @@ if recent_sum == 0:
                 'announcement_date': "no data",
                 'forecast_strategy': "3.4 - Неактивная компания"  # Стратегия для неактивных компаний
             })
-            ticker_forecast_count += 1
+```
+
+#### 3.0. Добавление прогнозов с сайта для будущих лет
+
+Если компания активна и есть ненулевые прогнозы с сайта, добавляются прогнозы с сайта для будущих лет:
+
+```python
+# Если были прогнозы с сайта для будущих лет, добавляем их как информацию
+if site_forecasts and site_forecasts_sum > 0:
+    logger.info(f"Для {ticker} есть ненулевые прогнозы с сайта на будущие годы, учитываем их при прогнозировании")
     
-    # Прекращаем обработку, так как уже создали прогнозы
-    return forecast_data, ticker_forecast_count
+    # Создаем прогнозы на основе прогнозов с сайта для будущих лет (но не текущего)
+    for forecast_key, site_forecast in site_forecasts.items():
+        try:
+            future_year = site_forecast['year']
+            quarter = site_forecast['quarter']
+            
+            # Пропускаем текущий год, так как его уже обработали выше
+            if future_year == current_year:
+                continue
+                
+            forecast_date = site_forecast['record_date']
+            
+            # Добавляем прогноз на основе данных с сайта
+            forecast_data.append({
+                'ticker': ticker,
+                'name': group['name'].iloc[0],
+                'record_date': forecast_date,
+                'record_date_str': forecast_date.strftime('%d.%m.%Y') if forecast_date else "no data",
+                'dividend_value': site_forecast['dividend_value'],
+                'period': f"Q{quarter} {future_year}" if quarter else f"{future_year}",
+                'forecast_type': 2,  # Наш прогноз (тип 2)
+                'year': future_year,
+                'quarter': quarter,
+                'month': forecast_date.month if forecast_date else None,
+                'announcement_date': "no data",
+                'forecast_strategy': "3.0 - Прогноз на основе данных сайта (будущие годы)"
+            })
+        except Exception as e:
+            logger.error(f"Не удалось создать прогноз на основе данных сайта для {ticker}: {e}")
+```
 
 #### 3.1. Прогнозирование на основе квартальных данных
 
@@ -114,55 +190,44 @@ if recent_sum == 0:
 3. **Создание прогнозов**:
    - Для каждого будущего года и каждого квартала создается прогноз
    - Используются рассчитанные средние значения дивидендов
+   - Если есть прогноз с сайта на это же время, используется он, иначе генерируется собственный прогноз
    - Даты выплат определяются на основе исторического анализа
 
 ```python
-# Если у нас есть квартальные данные, используем их для прогноза
-for quarter, history in ticker_quarters.items():
-    if not history:
-        continue
-    
-    # Рассчитываем средний дивиденд за квартал
-    avg_dividend = sum(item['dividend_value'] for item in history) / len(history)
-    
-    # Определяем типичный месяц выплаты
-    months = [item['month'] for item in history if pd.notnull(item['month'])]
-    
-    if not months:
-        # Если нет данных о месяце, используем текущий месяц
-        most_common_month = datetime.now().month
-    else:
-        most_common_month = int(max(set(months), key=months.count))
-    
-    # Определяем типичный день выплаты
-    days = [item['record_date'].day for item in history 
-           if isinstance(item['record_date'], datetime) 
-           and item['record_date'].month == most_common_month]
-    
-    if not days:
-        most_common_day = 15  # По умолчанию середина месяца
-    else:
-        most_common_day = int(sum(days) // len(days))
-    
-    logger.info(f"Для {ticker}, Q{quarter}: месяц={most_common_month}, день={most_common_day}, средний дивиденд={avg_dividend:.2f}")
-    
-    # Создаем прогнозы на будущие периоды
-    for future_year in range(current_year + 1, current_year + years + 1):
-        # ...создание прогноза...
-        forecast_data.append({
-            'ticker': ticker,
-            'name': group['name'].iloc[0],
-            'record_date': forecast_date,
-            'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-            'dividend_value': dividend_value,
-            'period': f"Q{quarter} {future_year}",
-            'forecast_type': 2,  # Наш прогноз (тип 2)
-            'year': future_year,
-            'quarter': quarter,
-            'month': forecast_date.month,
-            'announcement_date': "no data",
-            'forecast_strategy': "3.1 - Квартальные данные"  # Стратегия 3.1 из документации
-        })
+# Если у нас есть достаточно квартальных данных, дополняем прогнозы (стратегия 3.1)
+if has_quarterly_data:
+    for quarter, history in ticker_quarters.items():
+        if not history:
+            continue
+        
+        # Рассчитываем средний дивиденд за квартал
+        avg_dividend = sum(item['dividend_value'] for item in history) / len(history)
+        
+        # Определяем типичный месяц выплаты и типичный день выплаты
+        # ...
+        
+        # Создаем прогнозы на будущие периоды
+        for future_year in range(current_year + 1, current_year + years + 1):
+            try:
+                # Проверяем, есть ли прогноз с сайта доход на этот год и квартал
+                forecast_key = f"{future_year}-{quarter}"
+                site_forecast = site_forecasts.get(forecast_key)
+                
+                # Если есть прогноз сайта, используем его дату и дивиденд, иначе генерируем свой
+                if site_forecast and site_forecast['record_date']:
+                    forecast_date = site_forecast['record_date']
+                    dividend_value = site_forecast['dividend_value']
+                else:
+                    # ... создание собственного прогноза ...
+                    dividend_value = round(avg_dividend, 2)
+                
+                # Добавляем прогноз
+                forecast_data.append({
+                    # ... данные прогноза ...
+                    'forecast_strategy': "3.1 - Квартальные данные" if site_forecast is None else "3.0 - Прогноз на основе данных сайта"
+                })
+            except Exception as e:
+                logger.error(f"Не удалось создать прогноз для {ticker}, Q{quarter} {future_year}: {e}")
 ```
 
 #### 3.2. Прогнозирование на основе дат выплат внутри года
@@ -179,7 +244,7 @@ for quarter, history in ticker_quarters.items():
 
 3. **Создание прогнозов**:
    - Для каждой исторической даты выплаты и каждого будущего года создается прогноз
-   - Дивиденд прогнозируется на основе среднего значения для этой даты
+   - Если есть прогноз с сайта на это же время, используется он, иначе генерируется собственный прогноз
 
 ```python
 # Если у нас нет квартальных данных, но есть исторические даты выплат внутри года
@@ -188,37 +253,30 @@ if ticker_forecast_count == 0 and annual_payment_dates:
     
     # Для каждой уникальной даты внутри года делаем прогноз
     for (month, day), payments in annual_payment_dates.items():
-        # Считаем средний дивиденд для этой даты
-        avg_dividend = sum(item['dividend_value'] for item in payments) / len(payments)
-        
-        # Определяем квартал (если возможно)
-        quarters = [item['quarter'] for item in payments if item['quarter'] is not None]
-        if quarters:
-            # Берем наиболее частый квартал
-            quarter = max(set(quarters), key=quarters.count)
-        else:
-            # Определяем квартал по месяцу
-            quarter = (month - 1) // 3 + 1
-        
-        logger.info(f"Для {ticker}, дата {month}-{day}: квартал={quarter}, средний дивиденд={avg_dividend:.2f}")
+        # ... расчет среднего дивиденда и определение квартала ...
         
         # Создаем прогнозы на будущие периоды
         for future_year in range(current_year + 1, current_year + years + 1):
-            # ...создание прогноза...
-            forecast_data.append({
-                'ticker': ticker,
-                'name': group['name'].iloc[0],
-                'record_date': forecast_date,
-                'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                'dividend_value': dividend_value,
-                'period': f"Q{quarter} {future_year}",
-                'forecast_type': 2,  # Наш прогноз (тип 2)
-                'year': future_year,
-                'quarter': quarter,
-                'month': forecast_date.month,
-                'announcement_date': "no data",
-                'forecast_strategy': "3.2 - Даты выплат"  # Стратегия 3.2 из документации
-            })
+            try:
+                # Проверяем, есть ли прогноз с сайта доход на этот год и квартал
+                forecast_key = f"{future_year}-{quarter}"
+                site_forecast = site_forecasts.get(forecast_key)
+                
+                # Если есть прогноз сайта, используем его, иначе генерируем свой
+                if site_forecast and site_forecast['record_date']:
+                    forecast_date = site_forecast['record_date']
+                    dividend_value = site_forecast['dividend_value']
+                else:
+                    # ... создание собственного прогноза ...
+                    dividend_value = round(avg_dividend, 2)
+                
+                # Добавляем прогноз
+                forecast_data.append({
+                    # ... данные прогноза ...
+                    'forecast_strategy': "3.2 - Даты выплат" if site_forecast is None else "3.0 - Прогноз на основе данных сайта"
+                })
+            except Exception as e:
+                logger.error(f"Не удалось создать прогноз для {ticker} {future_year}-{month}-{day}: {e}")
 ```
 
 #### 3.3. Прогнозирование на основе годовых данных
@@ -230,254 +288,78 @@ if ticker_forecast_count == 0 and annual_payment_dates:
 
 2. **Распределение по кварталам**:
    - Годовой дивиденд равномерно распределяется по кварталам (делится на 4)
-   - Используются стандартные даты для каждого квартала (15 марта, 15 июня, 15 сентября, 15 декабря)
+   - Используются стандартные даты для каждого квартала
+   - Если есть прогноз с сайта на это же время, используется он, иначе генерируется собственный прогноз
 
 3. **Создание прогнозов**:
    - Для каждого квартала и будущего года создается прогноз
-   - Дивиденд для каждого квартала составляет 1/4 от среднего годового
 
 ```python
 # Если все еще нет прогнозов, используем годовые данные
 if ticker_forecast_count == 0 and len(all_payments) > 0:
-    try:
-        logger.info(f"Для {ticker} недостаточно данных о датах выплат, создаем годовой прогноз")
-        
-        # Рассчитываем средний дивиденд
-        avg_dividend = sum(item['dividend_value'] for item in all_payments) / len(all_payments)
-        
-        # Определяем типичные даты выплат по кварталам
-        quarterly_dates = [
-            (3, 15),   # Q1 - 15 марта
-            (6, 15),   # Q2 - 15 июня
-            (9, 15),   # Q3 - 15 сентября
-            (12, 15)   # Q4 - 15 декабря
-        ]
-        
-        # Создаем прогнозы для каждого квартала
-        for quarter, (month, day) in enumerate(quarterly_dates, 1):
-            # Дивиденд за квартал - делим годовой на 4 квартала
-            quarterly_dividend = round(avg_dividend / 4, 2)
-            
-            # ...создание прогноза...
-            forecast_data.append({
-                'ticker': ticker,
-                'name': group['name'].iloc[0],
-                'record_date': forecast_date,
-                'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                'dividend_value': quarterly_dividend,
-                'period': f"Q{quarter} {future_year}",
-                'forecast_type': 2,  # Наш прогноз (тип 2)
-                'year': future_year,
-                'quarter': quarter,
-                'month': forecast_date.month,
-                'announcement_date': "no data",
-                'forecast_strategy': "3.3 - Годовые данные"  # Стратегия 3.3 из документации
-            })
-    except Exception as e:
-        logger.error(f"Ошибка при создании годового прогноза для {ticker}: {e}")
-```
-
-В особых случаях, когда невозможно создать квартальные прогнозы, алгоритм создает единый годовой прогноз:
-
-```python
-# Если квартальные прогнозы не получились, делаем хотя бы один годовой прогноз
-try:
-    # ...определяем дату и размер выплаты...
+    logger.info(f"Для {ticker} недостаточно данных о датах выплат, создаем годовой прогноз")
     
-    # Добавляем годовой прогноз
-    forecast_data.append({
-        'ticker': ticker,
-        'name': group['name'].iloc[0],
-        'record_date': forecast_date,
-        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-        'dividend_value': round(yearly_dividend, 2),
-        'period': f"Год {future_year}",
-        'forecast_type': 2,  # Наш прогноз (тип 2)
-        'year': future_year,
-        'quarter': None,  # Годовой прогноз без квартала
-        'month': forecast_date.month,
-        'announcement_date': "no data",
-        'forecast_strategy': "3.3 - Единый годовой"  # Вариант стратегии 3.3
-    })
-except Exception as e:
-    logger.error(f"Ошибка при создании единого годового прогноза для {ticker}: {e}")
+    # Рассчитываем средний дивиденд
+    avg_dividend = sum(item['dividend_value'] for item in all_payments) / len(all_payments)
+    
+    # ... создание прогнозов на основе годовых данных ...
 ```
 
-#### 3.4. Аварийная стратегия прогнозирования
+#### 3.4. Аварийная стратегия
 
-Если нет никаких исторических данных для прогнозирования:
+Если не удалось создать прогноз ни одним из предыдущих методов, применяется аварийная стратегия:
 
-1. **Создание шаблонных прогнозов**:
-   - Используются стандартные даты для каждого квартала
-   - Дивиденд устанавливается равным нулю для всех прогнозов
-   - Создаются прогнозы для каждого квартала и каждого будущего года
+1. **Использование стандартных дат**:
+   - Создаются стандартные квартальные даты (15 марта, 15 июня, 15 сентября, 15 декабря)
+
+2. **Создание нулевых прогнозов**:
+   - Для каждого квартала и будущего года создается прогноз с нулевым дивидендом
 
 ```python
-# Если всё еще нет прогнозов, создаем аварийный прогноз
+# Если все еще нет прогнозов, применяем аварийную стратегию
 if ticker_forecast_count == 0:
-    try:
-        logger.info(f"Для {ticker} создаем аварийный прогноз")
-        
-        # Стандартные квартальные даты
-        quarterly_dates = [
-            (3, 15),   # Q1 - 15 марта
-            (6, 15),   # Q2 - 15 июня
-            (9, 15),   # Q3 - 15 сентября
-            (12, 15)   # Q4 - 15 декабря
-        ]
-        
-        # Создаем прогнозы для каждого квартала
-        for quarter, (month, day) in enumerate(quarterly_dates, 1):
-            # Дивиденд за квартал равен нулю
-            quarterly_dividend = 0.0
-            
-            for future_year in range(current_year + 1, current_year + years + 1):
-                try:
-                    forecast_date = datetime(future_year, month, day)
-                    
-                    # Добавляем прогноз для квартала
-                    forecast_data.append({
-                        'ticker': ticker,
-                        'name': group['name'].iloc[0],
-                        'record_date': forecast_date,
-                        'record_date_str': forecast_date.strftime('%d.%m.%Y'),
-                        'dividend_value': quarterly_dividend,
-                        'period': f"Q{quarter} {future_year}",
-                        'forecast_type': 2,  # Наш прогноз (тип 2)
-                        'year': future_year,
-                        'quarter': quarter,
-                        'month': forecast_date.month,
-                        'announcement_date': "no data",
-                        'forecast_strategy': "3.4 - Аварийная стратегия"  # Стратегия 3.4 из документации
-                    })
-                    ticker_forecast_count += 1
-                except Exception as e:
-                    logger.error(f"Не удалось создать аварийный прогноз для {ticker} Q{quarter} {future_year}: {e}")
-                    continue
-    except Exception as e:
-        logger.error(f"Ошибка при создании аварийного прогноза для {ticker}: {e}")
+    logger.info(f"Для {ticker} создаем аварийный прогноз")
+    
+    # Стандартные квартальные даты
+    quarterly_dates = [
+        (3, 15),   # Q1 - 15 марта
+        (6, 15),   # Q2 - 15 июня
+        (9, 15),   # Q3 - 15 сентября
+        (12, 15)   # Q4 - 15 декабря
+    ]
+    
+    # Создаем прогнозы с нулевыми дивидендами для каждого квартала
+    # ...
 ```
 
-### 4. Обработка специальных случаев
+## Сводка стратегий прогнозирования
 
-#### 4.1. Учет прогнозов с сайта
+| Код | Название | Описание |
+|-----|----------|----------|
+| 0 | Фактические данные | Исторические выплаты дивидендов |
+| 1 | Прогноз сайта | Прогнозы с сайта dohod.ru |
+| 3.0 - Прогноз на основе данных сайта (текущий год) | Данные текущего года с сайта | Прогнозы для текущего года с сайта dohod.ru |
+| 3.0 - Прогноз на основе данных сайта (будущие годы) | Данные будущих лет с сайта | Прогнозы для будущих лет с сайта dohod.ru |
+| 3.1 - Квартальные данные | Квартальные данные | Прогнозы на основе исторических квартальных выплат |
+| 3.2 - Даты выплат | Даты выплат | Прогнозы на основе исторических дат выплат внутри года |
+| 3.3 - Годовые данные | Годовые данные | Прогнозы на основе средних годовых выплат |
+| 3.4 - Неактивная компания | Критический сценарий | Нулевые прогнозы для неактивных компаний или при нулевых прогнозах с сайта |
+| 3.5 - Аварийная стратегия | Аварийная стратегия | Нулевые прогнозы при отсутствии исторических данных |
 
-Если для компании уже есть прогноз с сайта на определенный период:
-- Используется дата и размер дивиденда из прогноза сайта
-- Приоритет отдается прогнозу с сайта перед расчетным прогнозом
+## Приоритет стратегий
 
-```python
-# Проверяем, есть ли прогноз с сайта доход на этот год и квартал
-forecast_key = f"{future_year}-{quarter}"
-site_forecast = site_forecasts.get(forecast_key)
+1. Добавление прогнозов с сайта для текущего года (3.0 - текущий год)
+2. Критический сценарий при отсутствии выплат за последние 3 года или при нулевых прогнозах с сайта (3.4)
+3. Добавление прогнозов с сайта для будущих лет (3.0 - будущие годы)
+4. Прогнозирование на основе квартальных данных (3.1)
+5. Прогнозирование на основе дат выплат внутри года (3.2)
+6. Прогнозирование на основе годовых данных (3.3)
+7. Аварийная стратегия (3.5)
 
-# Если есть прогноз сайта, используем его дату, иначе генерируем свою
-if site_forecast and site_forecast['record_date']:
-    forecast_date = site_forecast['record_date']
-    # Используем дивиденд из прогноза сайта
-    dividend_value = site_forecast['dividend_value']
-else:
-    # Используем наш расчетный дивиденд
-    dividend_value = round(avg_dividend, 2)
-```
+## Выходные данные
 
-#### 4.2. Обработка невалидных дат
-
-Для невалидных дат (например, 30 февраля) применяются следующие правила:
-- Для февраля в високосном году используется 29 февраля, в невисокосном - 28 февраля
-- Для месяцев с 30 днями (апрель, июнь, сентябрь, ноябрь) используется 30 число
-- В остальных случаях дата корректируется на последний день предыдущего месяца
-
-```python
-try:
-    forecast_date = datetime(future_year_int, month_int, day_int)
-except ValueError:
-    # Обработка ошибок с невалидными датами
-    if month_int == 2 and day_int > 28:
-        # Для февраля используем последний день месяца
-        if future_year_int % 4 == 0 and (future_year_int % 100 != 0 or future_year_int % 400 == 0):
-            # Високосный год
-            forecast_date = datetime(future_year_int, 2, 29)
-        else:
-            # Не високосный год
-            forecast_date = datetime(future_year_int, 2, 28)
-    elif day_int > 30 and month_int in [4, 6, 9, 11]:
-        # Для месяцев с 30 днями
-        forecast_date = datetime(future_year_int, month_int, 30)
-    else:
-        # Для других случаев используем предыдущий месяц
-        if month_int > 1:
-            next_month = datetime(future_year_int, month_int, 1)
-            forecast_date = next_month - timedelta(days=1)
-        else:
-            forecast_date = datetime(future_year_int - 1, 12, 31)
-```
-
-## Результаты прогнозирования
-
-### Типы прогнозов и стратегий
-
-В результате каждая запись относится к одному из трех типов прогнозов:
-1. **Фактические данные (тип 0)** - реальные выплаты из истории
-2. **Прогнозы с сайта (тип 1)** - прогнозы, взятые с источника данных
-3. **Наши прогнозы (тип 2)** - прогнозы, сгенерированные алгоритмом
-
-И одной из стратегий прогнозирования:
-1. **0 - Фактические данные** - для исторических выплат
-2. **1 - Прогноз сайта** - для прогнозов с сайта
-3. **3.1 - Квартальные данные** - прогноз на основе квартальных выплат
-4. **3.2 - Даты выплат** - прогноз на основе дат выплат внутри года
-5. **3.3 - Годовые данные** - прогноз на основе годовых данных
-6. **3.4 - Неактивная компания** - компания не выплачивала дивиденды последние 3 года
-7. **3.4 - Аварийная стратегия** - запасной вариант при отсутствии исторических данных
-
-### Формат выходных данных
-
-Результаты прогнозирования содержат следующие поля:
-- **ticker**: тикер акции
-- **name**: название компании
-- **record_date**: дата закрытия реестра
-- **record_date_str**: дата в строковом формате
-- **dividend_value**: размер дивиденда
-- **period**: период выплаты (например, "Q2 2025")
-- **forecast_type**: тип прогноза (0, 1 или 2)
-- **forecast_type_str**: текстовое описание типа прогноза
-- **forecast_strategy**: стратегия прогнозирования (одна из перечисленных выше)
-- **year**: год выплаты
-- **quarter**: квартал выплаты
-- **month**: месяц выплаты
-- **announcement_date**: дата объявления дивиденда (если известна)
-
-## Сохранение результатов
-
-Результаты прогнозирования сохраняются в двух форматах:
-1. **Excel файл** - для удобства просмотра и анализа
-2. **JSON файл** - для дальнейшей обработки и интеграции с другими системами
-
-Пример сохранения результатов:
-
-```python
-# Сохранение в Excel
-output_df.to_excel(filename, index=False)
-
-# Сохранение в JSON
-with open(filename, 'w', encoding='utf-8') as f:
-    json.dump(records, f, ensure_ascii=False, indent=4)
-```
-
-## Особенности и ограничения
-
-- Алгоритм основан на предположении, что компании сохраняют схожий паттерн выплат дивидендов со временем
-- Используется вся глубина исторических данных для прогнозирования
-- Если компания не выплачивала дивиденды последние 3 года, она считается неактивной и прогнозы создаются с нулевыми дивидендами
-- Внешние факторы (экономические кризисы, смена политики выплат) не учитываются напрямую
-- Прогноз основан исключительно на исторических данных без учета фундаментальных показателей компании
-- В случае полного отсутствия данных все прогнозные дивиденды устанавливаются в нулевое значение
-
-## Возможные улучшения алгоритма
-
-1. Учет трендов изменения размера дивидендов со временем
-2. Интеграция с финансовыми показателями компаний
-3. Использование машинного обучения для более точного прогнозирования
-4. Учет сезонных факторов и специфики отраслей
-5. Добавление анализа вероятности выплаты дивидендов 
+- **Прогнозы дивидендов**: для каждой компании создаются прогнозы на будущие периоды
+- **Данные о стратегии прогнозирования**: для каждого прогноза указывается использованная стратегия
+- **Результаты сохраняются в форматах**:
+  - Excel (dividend_forecast.xlsx)
+  - JSON (dividend_forecast.json) 
